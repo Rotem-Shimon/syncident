@@ -506,6 +506,222 @@ def incidents_to_dataframe(incidents: list[Incident]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ---------------------------------------------------------------------------
+# Hybrid Continuous Sampling for Auto-Tune (opt-in, deterministic, no random)
+# ---------------------------------------------------------------------------
+
+# Grid of ASSIGN_THRESHOLD values swept during auto-tune.
+AUTOTUNE_THRESHOLDS: tuple[float, ...] = (0.65, 0.70, 0.75, 0.80)
+
+# Minimum number of incidents a candidate parameter set must produce on the
+# dense sample to avoid the "collapse everything into one bucket" failure mode.
+AUTOTUNE_MIN_INCIDENTS = 3
+
+# NRR penalty applied per missing incident below the minimum floor.
+# Shaped so even one collapsed-to-single outcome is definitively rejected.
+_AUTOTUNE_COLLAPSE_PENALTY = 0.5
+
+
+def extract_dense_sample(
+    df: pd.DataFrame,
+    target_ratio: float = 0.10,
+    max_rows: int = 50_000,
+) -> pd.DataFrame:
+    """
+    Locate the chronological window with the highest log density via frequency
+    binning on the datetime index, then extract a contiguous slice that covers
+    `target_ratio` of the full dataset (capped at `max_rows`).
+
+    Algorithm
+    ---------
+    1. Build a per-minute event count series with ``resample("1min")``.
+    2. Compute a rolling sum over a window equal to the target row count
+       (converted to minutes) to find the contiguous minute-band with the
+       most events.
+    3. Return the raw rows whose ``_ts`` falls inside that band, capped at
+       ``max_rows`` by taking a stride-1 head (preserving temporal order).
+
+    The function is fully deterministic: no shuffling, no random state.
+
+    Parameters
+    ----------
+    df:
+        Normalized event DataFrame as returned by ``load_normalized_events``.
+        Must contain a ``_ts`` datetime column.
+    target_ratio:
+        Fraction of ``len(df)`` to target for the sample size before the
+        ``max_rows`` cap is applied.  Default is 10 %.
+    max_rows:
+        Hard upper bound on rows returned regardless of ``target_ratio``.
+
+    Returns
+    -------
+    pd.DataFrame
+        A contiguous temporal slice of ``df``, reset-indexed.
+    """
+    if df.empty:
+        return df.copy()
+
+    n_total = len(df)
+    target_n = max(1, min(int(n_total * target_ratio), max_rows))
+
+    # Fast path: dataset is already small enough.
+    if n_total <= target_n:
+        return df.reset_index(drop=True)
+
+    ts_col: pd.Series = df["_ts"] if "_ts" in df.columns else pd.to_datetime(df["timestamp"])
+
+    # Build a 1-minute frequency count series anchored to the dataset start.
+    # Using a copy avoids mutating the caller's frame.
+    freq_series = (
+        pd.Series(1, index=ts_col, name="count")
+        .resample("1min")
+        .sum()
+        .fillna(0)
+    )
+
+    if freq_series.empty or freq_series.sum() == 0:
+        # Degenerate dataset (all same timestamp): just return the head.
+        return df.head(target_n).reset_index(drop=True)
+
+    # Estimate how many minutes the target_n rows span on average.
+    total_minutes = max(1, len(freq_series))
+    mins_per_row = total_minutes / n_total
+    window_minutes = max(1, int(math.ceil(target_n * mins_per_row)))
+
+    if window_minutes >= total_minutes:
+        return df.head(target_n).reset_index(drop=True)
+
+    # Rolling sum to find the densest window.
+    rolling_sums = freq_series.rolling(window=window_minutes, min_periods=1).sum()
+    # argmax is deterministic on a sorted index.
+    peak_end_ts: pd.Timestamp = rolling_sums.idxmax()
+    peak_start_ts: pd.Timestamp = peak_end_ts - pd.Timedelta(minutes=window_minutes - 1)
+
+    mask = (ts_col >= peak_start_ts) & (ts_col <= peak_end_ts + pd.Timedelta(seconds=59))
+    slice_df = df.loc[mask]
+
+    # If the window yielded fewer rows than target (sparse data), expand to head.
+    if len(slice_df) < 1:
+        slice_df = df
+
+    # Cap at max_rows preserving temporal order (head, not stride-sample).
+    result = slice_df.head(target_n).reset_index(drop=True)
+    return result
+
+
+def auto_tune_parameters(
+    dense_df: pd.DataFrame,
+) -> dict[str, object]:
+    """
+    Deterministic grid search over ``FusionParams`` on a dense sample slice.
+
+    Search space
+    ------------
+    - ``ASSIGN_THRESHOLD``: values in ``AUTOTUNE_THRESHOLDS`` (4 points).
+    - Weight triplets (w_time, w_component, w_text): all combinations on a
+      0.1-step grid that sum to 1.0 (66 triplets), yielding
+      4 × 66 = 264 candidate configurations total.
+
+    Scoring
+    -------
+    score = NRR − collapse_penalty
+
+    where ``collapse_penalty`` is non-zero only when ``n_incidents`` falls
+    below ``AUTOTUNE_MIN_INCIDENTS``.  This hard-penalises configurations that
+    over-merge the sample into fewer than three incident buckets, preventing
+    degenerate "compress everything" solutions from winning.
+
+    The search is fully deterministic (no ``random`` module usage) and safe to
+    run on a small dense slice to avoid memory exhaustion on large datasets.
+
+    Parameters
+    ----------
+    dense_df:
+        A pre-extracted dense sample as returned by ``extract_dense_sample``.
+        Must already have the ``_ts`` column present.
+
+    Returns
+    -------
+    dict with keys:
+        ``params``        – best ``FusionParams`` found.
+        ``best_score``    – penalised NRR of the winning configuration.
+        ``best_nrr``      – raw NRR (before penalty).
+        ``n_incidents``   – incident count on the sample for the best params.
+        ``n_sample``      – number of rows in ``dense_df``.
+        ``total_tested``  – total parameter combinations evaluated.
+        ``feasible``      – combinations that passed the collapse guard.
+    """
+    n_sample = len(dense_df)
+    if n_sample == 0:
+        return {
+            "params": default_fusion_params(),
+            "best_score": 0.0,
+            "best_nrr": 0.0,
+            "n_incidents": 0,
+            "n_sample": 0,
+            "total_tested": 0,
+            "feasible": 0,
+        }
+
+    best_params: FusionParams = default_fusion_params()
+    best_score: float = -1.0
+    best_nrr: float = 0.0
+    best_n_incidents: int = 0
+    total_tested = 0
+    feasible = 0
+
+    # Weight grid: all (w_time, w_component, w_text) with 0.1 resolution that
+    # sum to 1.0, normalised inside FusionParams construction.
+    for threshold in AUTOTUNE_THRESHOLDS:
+        for i in range(11):
+            for j in range(11 - i):
+                k = 10 - i - j
+                w_time_raw = i / 10.0
+                w_comp_raw = j / 10.0
+                w_text_raw = k / 10.0
+                weight_sum = w_time_raw + w_comp_raw + w_text_raw
+                if weight_sum <= 0:
+                    continue
+                params = FusionParams(
+                    w_time=w_time_raw / weight_sum,
+                    w_component=w_comp_raw / weight_sum,
+                    w_text=w_text_raw / weight_sum,
+                    assign_threshold=threshold,
+                )
+                total_tested += 1
+
+                incidents, _ = run_alert_fusion(dense_df, params)
+                n_inc = len(incidents)
+
+                nrr = 1.0 - (n_inc / n_sample) if n_sample > 0 else 0.0
+
+                # Collapse penalty: reject configurations that obliterate all
+                # structure in the sample.
+                if n_inc < AUTOTUNE_MIN_INCIDENTS:
+                    deficit = AUTOTUNE_MIN_INCIDENTS - n_inc
+                    score = nrr - _AUTOTUNE_COLLAPSE_PENALTY * deficit
+                else:
+                    score = nrr
+                    feasible += 1
+
+                if score > best_score:
+                    best_score = score
+                    best_nrr = nrr
+                    best_params = params
+                    best_n_incidents = n_inc
+
+    return {
+        "params": best_params,
+        "best_score": round(best_score, 6),
+        "best_nrr": round(best_nrr, 6),
+        "n_incidents": best_n_incidents,
+        "n_sample": n_sample,
+        "total_tested": total_tested,
+        "feasible": feasible,
+    }
+
+
 def run_clustering(
     input_csv: Path,
     output_csv: Path,

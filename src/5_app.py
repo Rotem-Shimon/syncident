@@ -241,6 +241,30 @@ def _inject_styles() -> None:
                 border-color: rgba(0,242,255,0.45) !important;
                 background: rgba(0,242,255,0.06) !important;
             }
+
+            .autotune-card {
+                border: 1px solid rgba(245,158,11,0.35);
+                border-radius: 14px;
+                background: rgba(15,23,42,0.60);
+                backdrop-filter: blur(10px);
+                padding: 1rem 1.2rem;
+                margin-top: 0.6rem;
+            }
+            .autotune-title {
+                margin: 0 0 0.3rem 0;
+                color: #f59e0b;
+                font-size: 0.75rem;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 0.09em;
+            }
+            .autotune-value {
+                margin: 0;
+                color: #E5E7EB;
+                font-size: 1.05rem;
+                font-weight: 600;
+                line-height: 1.55;
+            }
         </style>
         """,
         unsafe_allow_html=True,
@@ -290,6 +314,8 @@ def _init_state() -> None:
         st.session_state.run_data = None
     if "manual_csv_mapping" not in st.session_state:
         st.session_state.manual_csv_mapping = False
+    if "autotune_result" not in st.session_state:
+        st.session_state.autotune_result = None
 
 
 def _iter_weights_grid_01() -> Iterator[tuple[float, float, float]]:
@@ -921,6 +947,106 @@ def _smart_table(smart_df: pd.DataFrame, run_dir: str) -> None:
         _render_incident_events(run_dir, pick)
 
 
+def _autotune_section(run_dir: str) -> None:
+    """
+    Opt-in Auto-Tune expander: extracts the densest sample slice, runs a
+    deterministic grid search over FusionParams, displays results, and offers
+    a one-click button to re-run the full pipeline with the discovered params.
+    """
+    with st.expander("⚙️ Auto-Tune Parameters (Hybrid Continuous Sampling)", expanded=False):
+        st.warning(
+            "**Compute-heavy operation.** Auto-Tune extracts the densest 10 % of your "
+            "log stream (up to 50 000 events) and runs a 264-point deterministic grid "
+            "search over ASSIGN_THRESHOLD × weight combinations. On large datasets this "
+            "may take several minutes. The main dashboard remains usable while you decide."
+        )
+
+        tuned = st.session_state.get("autotune_result")
+
+        col_run, col_apply = st.columns([1, 1])
+        tune_clicked = col_run.button(
+            "▶ Run Auto-Tune",
+            key="autotune_run_btn",
+            help="Analyse the densest slice of the current dataset to find optimal parameters.",
+            use_container_width=True,
+        )
+        apply_disabled = tuned is None
+        apply_clicked = col_apply.button(
+            "✔ Apply & Re-run Pipeline",
+            key="autotune_apply_btn",
+            disabled=apply_disabled,
+            help="Re-run the full analysis with the Auto-Tune discovered parameters.",
+            use_container_width=True,
+        )
+
+        if tune_clicked:
+            norm_path = Path(run_dir) / "normalized_events.csv"
+            if not norm_path.is_file():
+                st.error("Normalized events artifact not found. Run the main analysis first.")
+            else:
+                with st.spinner(
+                    "Extracting densest sample slice and running grid search… "
+                    "This may take a few minutes."
+                ):
+                    norm_df = clustering.load_normalized_events(norm_path)
+                    dense = clustering.extract_dense_sample(norm_df, target_ratio=0.10, max_rows=50_000)
+                    del norm_df
+                    gc.collect()
+                    result = clustering.auto_tune_parameters(dense)
+                    del dense
+                    gc.collect()
+                st.session_state.autotune_result = result
+                tuned = result
+                st.success(
+                    f"Grid search complete — evaluated {result['total_tested']} "
+                    f"configurations ({result['feasible']} feasible) on "
+                    f"{result['n_sample']:,} sampled events."
+                )
+
+        if tuned is not None:
+            p: Any = tuned["params"]
+            st.markdown("#### Discovered optimal parameters")
+            r1, r2, r3, r4 = st.columns(4)
+            r1.markdown(
+                f"<div class='autotune-card'>"
+                f"<p class='autotune-title'>W_TIME</p>"
+                f"<p class='autotune-value'>{p.w_time:.3f}</p>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            r2.markdown(
+                f"<div class='autotune-card'>"
+                f"<p class='autotune-title'>W_COMPONENT</p>"
+                f"<p class='autotune-value'>{p.w_component:.3f}</p>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            r3.markdown(
+                f"<div class='autotune-card'>"
+                f"<p class='autotune-title'>W_TEXT</p>"
+                f"<p class='autotune-value'>{p.w_text:.3f}</p>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            r4.markdown(
+                f"<div class='autotune-card'>"
+                f"<p class='autotune-title'>ASSIGN_THRESHOLD</p>"
+                f"<p class='autotune-value'>{p.assign_threshold:.2f}</p>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                f"Best penalised score: **{tuned['best_score']:.4f}** "
+                f"(raw NRR {tuned['best_nrr']:.4f}, "
+                f"{tuned['n_incidents']} incidents on {tuned['n_sample']:,} sample events)."
+            )
+
+        if apply_clicked and tuned is not None:
+            p = tuned["params"]
+            st.session_state["_autotune_pending_params"] = p
+            st.rerun()
+
+
 def main() -> None:
     st.set_page_config(page_title="Syncident | Intelligence", page_icon="◆", layout="wide", initial_sidebar_state="expanded")
     _inject_styles()
@@ -930,8 +1056,64 @@ def main() -> None:
     if pending_opt is not None:
         st.session_state.r1, st.session_state.r2, st.session_state.r3 = pending_opt
 
+    # Apply deferred Auto-Tune param application: re-run pipeline with discovered params.
+    pending_at = st.session_state.pop("_autotune_pending_params", None)
+
     controls = _sidebar_ui()
     progress_slot = st.empty()
+
+    if pending_at is not None:
+        run_data_prev = st.session_state.get("run_data")
+        if run_data_prev:
+            uploaded_placeholder = None
+            # Re-run using the on-disk normalized CSV so we never need the upload object again.
+            norm_path = Path(run_data_prev["run_dir"]) / "normalized_events.csv"
+            if norm_path.is_file():
+                _show_pulse(progress_slot)
+                try:
+                    with st.spinner(
+                        "Re-running full pipeline with Auto-Tune parameters…"
+                    ):
+                        norm_df = clustering.load_normalized_events(norm_path)
+                        run_dir = _safe_run_dir()
+                        baseline_df = baseline.group_baseline_incidents(norm_df)
+                        incidents, alert_assign = clustering.run_alert_fusion(norm_df, pending_at)
+                        smart_df = clustering.incidents_to_dataframe(incidents)
+                        del incidents
+                        gc.collect()
+                        metrics = evaluation.build_metrics_from_frames(
+                            baseline_df, smart_df, norm_df, None
+                        )
+                        metadata: dict[str, Any] = {
+                            "run_time": datetime.now().isoformat(timespec="seconds"),
+                            "source_file": "auto_tune_rerun",
+                            "mode": "auto_tune",
+                            "skipped_count": 0,
+                            "known_issues_file": None,
+                            "known_issues_skipped": 0,
+                            "params": {
+                                "w_time": pending_at.w_time,
+                                "w_component": pending_at.w_component,
+                                "w_text": pending_at.w_text,
+                                "assign_threshold": pending_at.assign_threshold,
+                            },
+                        }
+                        export_base_assign = baseline.event_to_baseline_incident_ids(norm_df).tolist()
+                        _save_run_artifacts(
+                            run_dir, norm_df, baseline_df, smart_df,
+                            metrics, metadata, export_base_assign, alert_assign,
+                        )
+                        del norm_df, baseline_df, smart_df, alert_assign, export_base_assign
+                        gc.collect()
+                        _load_ui_context.clear()
+                        _load_incident_events.clear()
+                        st.session_state.run_data = {"run_dir": str(run_dir), "skipped_records": [], "skipped_records_truncated": 0}
+                        st.session_state.autotune_result = None
+                        st.rerun()
+                except Exception as exc:
+                    st.error(f"Auto-Tune re-run failed: {exc}")
+                finally:
+                    _hide_pulse(progress_slot)
 
     if controls["optimize_clicked"]:
         run_data = st.session_state.get("run_data")
@@ -1016,6 +1198,8 @@ def main() -> None:
             _timeline_chart(smart_df, known_issues_df)
             del known_issues_df
             gc.collect()
+            st.divider()
+            _autotune_section(run_data["run_dir"])
 
     with tab_data:
         if ui_ctx:
