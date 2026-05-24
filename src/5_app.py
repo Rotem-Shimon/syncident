@@ -265,6 +265,38 @@ def _inject_styles() -> None:
                 font-weight: 600;
                 line-height: 1.55;
             }
+
+            /* ── Text wrapping & overflow ── */
+            /* Prevent long component IDs and log messages from being clipped in
+               dataframes, cards, and expander bodies. */
+            .stDataFrame td, .stDataFrame th {
+                white-space: normal !important;
+                word-wrap: break-word !important;
+                overflow-wrap: break-word !important;
+                max-width: 520px;
+            }
+            .kpi-value, .kpi-value-green {
+                white-space: normal;
+                word-wrap: break-word;
+                overflow-wrap: break-word;
+            }
+            .summary-text {
+                white-space: normal;
+                word-wrap: break-word;
+                overflow-wrap: break-word;
+            }
+            .autotune-value {
+                white-space: normal;
+                word-wrap: break-word;
+                overflow-wrap: break-word;
+            }
+            /* Markdown inside expanders */
+            .streamlit-expanderContent p,
+            .streamlit-expanderContent li {
+                white-space: normal;
+                word-wrap: break-word;
+                overflow-wrap: break-word;
+            }
         </style>
         """,
         unsafe_allow_html=True,
@@ -314,8 +346,11 @@ def _init_state() -> None:
         st.session_state.run_data = None
     if "manual_csv_mapping" not in st.session_state:
         st.session_state.manual_csv_mapping = False
-    if "autotune_result" not in st.session_state:
-        st.session_state.autotune_result = None
+    # Auto-Tune persistent state — survives every Streamlit rerun.
+    if "autotune_done" not in st.session_state:
+        st.session_state.autotune_done = False
+    if "autotune_results" not in st.session_state:
+        st.session_state.autotune_results = None
 
 
 def _iter_weights_grid_01() -> Iterator[tuple[float, float, float]]:
@@ -590,11 +625,16 @@ def _run_auto_tune(df: pd.DataFrame, assign_threshold: float, recipes: list[tupl
 # ---------- Rendering ----------
 def _sidebar_ui() -> dict[str, Any]:
     _init_state()
-    st.sidebar.markdown("### Input")
-    uploaded = st.sidebar.file_uploader("Upload file", type=["csv", "txt", "log", "json"])
-    with st.sidebar.expander("Validate Results (Optional)", expanded=False):
-        known_issues_upload = st.sidebar.file_uploader("Upload Known Issues", type=["json"])
+    st.sidebar.markdown("### Upload Log File")
+    uploaded = st.sidebar.file_uploader(
+        "Supported formats: CSV, TXT, LOG, JSON",
+        type=["csv", "txt", "log", "json"],
+        label_visibility="visible",
+    )
+    with st.sidebar.expander("Validate Against Known Issues (Optional)", expanded=False):
+        known_issues_upload = st.sidebar.file_uploader("Known Issues JSON", type=["json"])
     run_clicked = st.sidebar.button("Run Analysis", type="primary", use_container_width=True)
+    st.sidebar.divider()
 
     parser_mode = "text"
     mapper: dict[str, str] = {}
@@ -635,8 +675,10 @@ def _sidebar_ui() -> dict[str, Any]:
                 )
                 allow_manual_fix = True
             st.sidebar.caption(
-                "Automatically detected schema: "
-                f"[{mapper.get('timestamp', '?')}, {mapper.get('component', '?')}, {mapper.get('raw_message', '?')}]"
+                "**Auto-detected schema**  \n"
+                f"Timestamp → `{mapper.get('timestamp', '?')}`  \n"
+                f"Component → `{mapper.get('component', '?')}`  \n"
+                f"Message → `{mapper.get('raw_message', '?')}`"
             )
     elif uploaded is not None and str(uploaded.name).lower().endswith(".json"):
         parser_mode = "json"
@@ -644,7 +686,7 @@ def _sidebar_ui() -> dict[str, Any]:
     else:
         st.session_state.manual_csv_mapping = False
 
-    with st.sidebar.expander("System Internals", expanded=False):
+    with st.sidebar.expander("Advanced Settings", expanded=False):
         if parser_mode == "text":
             regex_pattern = st.text_area("Regex Parser", value=ingestion.HDFS_REGEX_TEMPLATE, height=120)
         elif parser_mode == "csv":
@@ -660,21 +702,22 @@ def _sidebar_ui() -> dict[str, Any]:
         else:
             st.caption("JSON mode uses automatic field detection for timestamp/component/message.")
 
-        st.markdown("**W_TIME**")
-        st.slider("W_TIME", 0.0, 1.0, step=0.1, key="r1", label_visibility="collapsed")
+        st.markdown("**Time Weight**")
+        st.slider("Time Weight", 0.0, 1.0, step=0.1, key="r1", label_visibility="collapsed")
         st.caption(CAPTION_W_TIME)
-        st.markdown("**W_COMPONENT**")
-        st.slider("W_COMPONENT", 0.0, 1.0, step=0.1, key="r2", label_visibility="collapsed")
+        st.markdown("**Component Weight**")
+        st.slider("Component Weight", 0.0, 1.0, step=0.1, key="r2", label_visibility="collapsed")
         st.caption(CAPTION_W_COMPONENT)
-        st.markdown("**W_TEXT**")
-        st.slider("W_TEXT", 0.0, 1.0, step=0.1, key="r3", label_visibility="collapsed")
+        st.markdown("**Text Weight**")
+        st.slider("Text Weight", 0.0, 1.0, step=0.1, key="r3", label_visibility="collapsed")
         st.caption(CAPTION_W_TEXT)
-        st.markdown("**ASSIGN_THRESHOLD**")
-        st.slider("ASSIGN_THRESHOLD", 0.35, 0.95, step=0.05, key="thr", label_visibility="collapsed")
+        st.markdown("**Assignment Threshold**")
+        st.slider("Assignment Threshold", 0.35, 0.95, step=0.05, key="thr", label_visibility="collapsed")
         st.caption(CAPTION_ASSIGN)
+        st.divider()
         st.select_slider("Optimization Depth", options=DEPTH_OPTIONS, key="opt_depth")
         optimize_clicked = st.button(
-            "Optimize",
+            "Optimize Weights",
             help="Searches for the best weights to maximize noise reduction without breaking incident logic.",
             type="secondary",
             use_container_width=True,
@@ -773,7 +816,7 @@ def _truncate_component_id(comp: str) -> str:
 def _top_components_from_summary(smart_df: pd.DataFrame) -> None:
     with st.expander("🔍 Top Affected Components", expanded=False):
         if smart_df.empty:
-            st.write("No component data available.")
+            st.caption("No component data available.")
             return
         counts: dict[str, int] = {}
         for row in smart_df.itertuples(index=False):
@@ -783,7 +826,7 @@ def _top_components_from_summary(smart_df: pd.DataFrame) -> None:
                 if comp:
                     counts[comp] = counts.get(comp, 0) + weight
         if not counts:
-            st.write("No component data available.")
+            st.caption("No component data available.")
             return
         for name, cnt in sorted(counts.items(), key=lambda x: (-x[1], x[0]))[:3]:
             short = _truncate_component_id(name)
@@ -943,15 +986,22 @@ def _smart_table(smart_df: pd.DataFrame, run_dir: str) -> None:
     gc.collect()
 
     if pick != "(all)":
-        st.markdown("#### Incident event log (lazy-loaded from disk)")
+        st.divider()
+        st.markdown(f"#### Event Log — Incident {pick}")
+        st.caption("Events loaded on demand from the on-disk artifact. Raw messages are truncated at 200 characters.")
         _render_incident_events(run_dir, pick)
 
 
 def _autotune_section(run_dir: str) -> None:
     """
     Opt-in Auto-Tune expander: extracts the densest sample slice, runs a
-    deterministic grid search over FusionParams, displays results, and offers
-    a one-click button to re-run the full pipeline with the discovered params.
+    deterministic grid search over FusionParams, and persistently displays
+    results across Streamlit reruns via st.session_state.
+
+    State keys
+    ----------
+    autotune_done    : bool  — True once a search has completed successfully.
+    autotune_results : dict  — raw result dict from auto_tune_parameters().
     """
     with st.expander("⚙️ Auto-Tune Parameters (Hybrid Continuous Sampling)", expanded=False):
         st.warning(
@@ -961,22 +1011,11 @@ def _autotune_section(run_dir: str) -> None:
             "may take several minutes. The main dashboard remains usable while you decide."
         )
 
-        tuned = st.session_state.get("autotune_result")
-
-        col_run, col_apply = st.columns([1, 1])
-        tune_clicked = col_run.button(
+        # ── Trigger button ────────────────────────────────────────────────────
+        tune_clicked = st.button(
             "▶ Run Auto-Tune",
             key="autotune_run_btn",
             help="Analyse the densest slice of the current dataset to find optimal parameters.",
-            use_container_width=True,
-        )
-        apply_disabled = tuned is None
-        apply_clicked = col_apply.button(
-            "✔ Apply & Re-run Pipeline",
-            key="autotune_apply_btn",
-            disabled=apply_disabled,
-            help="Re-run the full analysis with the Auto-Tune discovered parameters.",
-            use_container_width=True,
         )
 
         if tune_clicked:
@@ -995,16 +1034,20 @@ def _autotune_section(run_dir: str) -> None:
                     result = clustering.auto_tune_parameters(dense)
                     del dense
                     gc.collect()
-                st.session_state.autotune_result = result
-                tuned = result
-                st.success(
-                    f"Grid search complete — evaluated {result['total_tested']} "
-                    f"configurations ({result['feasible']} feasible) on "
-                    f"{result['n_sample']:,} sampled events."
-                )
+                # Persist into session_state so results survive all subsequent reruns.
+                st.session_state.autotune_done = True
+                st.session_state.autotune_results = result
 
-        if tuned is not None:
+        # ── Results — rendered entirely from session_state ────────────────────
+        if st.session_state.autotune_done and st.session_state.autotune_results is not None:
+            tuned: dict[str, Any] = st.session_state.autotune_results
             p: Any = tuned["params"]
+
+            st.success(
+                f"Grid search complete — evaluated {tuned['total_tested']} "
+                f"configurations ({tuned['feasible']} feasible) on "
+                f"{tuned['n_sample']:,} sampled events."
+            )
             st.markdown("#### Discovered optimal parameters")
             r1, r2, r3, r4 = st.columns(4)
             r1.markdown(
@@ -1041,10 +1084,17 @@ def _autotune_section(run_dir: str) -> None:
                 f"{tuned['n_incidents']} incidents on {tuned['n_sample']:,} sample events)."
             )
 
-        if apply_clicked and tuned is not None:
-            p = tuned["params"]
-            st.session_state["_autotune_pending_params"] = p
-            st.rerun()
+            # ── Apply button — only shown once results are visible ────────────
+            st.markdown("---")
+            apply_clicked = st.button(
+                "✔ Apply Discovered Parameters & Re-run Full Pipeline",
+                key="autotune_apply_btn",
+                help="Re-run the full AlertFusion pipeline with the parameters found above.",
+                use_container_width=True,
+            )
+            if apply_clicked:
+                st.session_state["_autotune_pending_params"] = p
+                st.rerun()
 
 
 def main() -> None:
@@ -1107,8 +1157,13 @@ def main() -> None:
                         gc.collect()
                         _load_ui_context.clear()
                         _load_incident_events.clear()
-                        st.session_state.run_data = {"run_dir": str(run_dir), "skipped_records": [], "skipped_records_truncated": 0}
-                        st.session_state.autotune_result = None
+                        st.session_state.run_data = {
+                            "run_dir": str(run_dir),
+                            "skipped_records": [],
+                            "skipped_records_truncated": 0,
+                        }
+                        st.session_state.autotune_done = False
+                        st.session_state.autotune_results = None
                         st.rerun()
                 except Exception as exc:
                     st.error(f"Auto-Tune re-run failed: {exc}")
@@ -1186,9 +1241,11 @@ def main() -> None:
             metrics = ui_ctx["metrics"]
             smart_df = ui_ctx["smart_df"]
             known_issues_df = _load_known_issues(run_data["run_dir"])
+            run_folder = Path(run_data["run_dir"]).name
             st.caption(
-                f"Dashboard loaded from `{evaluation.INCIDENTS_SUMMARY_FILENAME}` "
-                f"in `{run_data['run_dir']}`. Event payloads load on demand from disk."
+                f"Results loaded from run **{run_folder}**. "
+                "Incident metadata is read from the lightweight summary index; "
+                "raw event payloads are fetched from disk only when you drill into a specific incident."
             )
             _hero_funnel(metrics)
             _kpi_cards(metrics, smart_df)
