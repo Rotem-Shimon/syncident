@@ -111,13 +111,12 @@ W_COMPONENT = 0.30
 W_TEXT = 0.35
 
 # --- Family-specific AlertFusion weighting (each family's triple sums to 1.0) ----------
-# Topology / CSV pipeline (cascading microservice telemetry): time proximity leads so a
-# tight burst of failures stays in one cascade, with component and text as light tie-breakers.
-# The Jaccard trap (a new failing component scoring 0.0 and dragging the total below the
-# threshold) is neutralized in the component scorer, not by inflating the component weight.
-CSV_W_TIME = 0.60
-CSV_W_COMPONENT = 0.20
-CSV_W_TEXT = 0.20
+# Topology / CSV pipeline (cascading microservice telemetry): time weight is kept below
+# ASSIGN_THRESHOLD (0.5) so time proximity alone can never force a merge; component and
+# text must contribute positively for an event to be absorbed into an existing cluster.
+CSV_W_TIME = 0.40
+CSV_W_COMPONENT = 0.35
+CSV_W_TEXT = 0.25
 # Text pipeline (system logs): time decay leads to anchor temporal bursts, with strict
 # template similarity as the primary discriminator and component as a light tie-breaker.
 TEXT_W_TIME = 0.50
@@ -130,13 +129,21 @@ TEXT_W_TEXT = 0.40
 # The tight 5 s window (down from 10 s) combined with the burst-density guard prevents creeping
 # background noise from continuously extending a cascade into a multi-hour mega-incident.
 TOPOLOGY_NEUTRAL_COMPONENT_WINDOW_SEC = 5.0
-TOPOLOGY_NEUTRAL_COMPONENT_SCORE = 0.5
+TOPOLOGY_NEUTRAL_COMPONENT_SCORE = 0.30
 
 # Hard ceiling on topology-incident lifespan. Once an incident's elapsed wall-clock time
 # exceeds this limit it is excluded from the active pool, forcing the cascade to close and a
-# clean incident to open. This prevents the rolling end_time anchor from enabling a single
-# incident to span the full dataset when background noise keeps arriving.
-TOPOLOGY_MAX_INCIDENT_DURATION_SEC = 3600
+# clean incident to open. With the corrected CSV weights (time < ASSIGN_THRESHOLD), incidents
+# now close naturally via the 600 s rolling active window; this ceiling is raised to 86400 s
+# (24 h) so it acts as a genuine safety net rather than the primary cut-off.
+TOPOLOGY_MAX_INCIDENT_DURATION_SEC = 86400
+
+# Post-processing merge ceiling: the offline merge_incidents pass may only stitch two adjacent
+# incidents together if the combined span (current.start_time → max(end_times)) does not exceed
+# this limit. Kept intentionally smaller than TOPOLOGY_MAX_INCIDENT_DURATION_SEC so the 24-hour
+# runtime tracking window stays open while the merge pass cannot re-assemble independent blocks
+# into a multi-hour mega-incident.
+MAX_MERGE_DURATION_SEC = 7200
 
 # Text pipeline "absorption" rule: when the active-window median inter-arrival delta collapses
 # (an alert flood / storm), the required assignment threshold is temporarily lowered by
@@ -760,14 +767,13 @@ def merge_incidents(
     """
     Merge adjacent closed incidents when ALL hold:
         1. gap = next.start_time - current.end_time <= flapping_window_sec
-        2. their involved-component sets intersect (share at least one component)
-        3. the resulting merged incident would not exceed max_duration_sec (when set)
+        2. Jaccard similarity of the two component sets >= 0.20 (strict overlap guard)
+        3. the combined span (current.start_time → max(end_times)) <= MAX_MERGE_DURATION_SEC
 
-    Condition 3 is used by the topology pipeline to ensure the ceiling introduced by
-    TOPOLOGY_MAX_INCIDENT_DURATION_SEC is not silently undone by the merge pass: a
-    force-closed incident must not be re-stitched to the next one if the combined span
-    would exceed the maximum lifespan, preventing a continuous cascade from being
-    re-assembled into a multi-hour mega-incident after clustering.
+    Condition 3 uses the module-level MAX_MERGE_DURATION_SEC constant (not the runtime
+    max_duration_sec parameter) so the 24-hour runtime tracking window remains open while
+    the offline merge pass cannot re-assemble independent blocks into a multi-hour giant.
+    The max_duration_sec parameter is retained for call-site backward compatibility.
 
     Returns the merged list (ordered by start_time) and an old->final id map.
     """
@@ -785,12 +791,15 @@ def merge_incidents(
         old_to_root[nxt.incident_id] = nxt.incident_id
         gap_sec = (nxt.start_time - current.end_time).total_seconds()
 
-        shared_components = bool(set(current.component_counts) & set(nxt.component_counts))
+        a = set(current.component_counts)
+        b = set(nxt.component_counts)
+        union = a | b
+        jaccard = len(a & b) / len(union) if union else 0.0
+        shared_components = jaccard >= 0.20
 
         would_exceed_ceiling = (
-            max_duration_sec is not None
-            and (max(current.end_time, nxt.end_time) - current.start_time).total_seconds()
-            > max_duration_sec
+            (max(current.end_time, nxt.end_time) - current.start_time).total_seconds()
+            > MAX_MERGE_DURATION_SEC
         )
 
         if gap_sec <= flapping_window_sec and shared_components and not would_exceed_ceiling:
