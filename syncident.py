@@ -18,14 +18,23 @@ Execution modes
     python syncident.py --input <log_or_csv> [--mode text|csv] [--ground-truth <gt.json>]
         -> prints the baseline vs AlertFusion comparison matrix to the terminal.
 
-Deterministic core algorithms (mathematically untouched)
---------------------------------------------------------
+Deterministic core algorithms
+-----------------------------
     * Baseline       : consecutive 300 s fixed windows anchored to the first timestamp.
-    * AlertFusion    : single-pass incremental clustering, 600 s active sliding window.
+    * AlertFusion    : `run_alert_fusion` is a thin dispatcher over two isolated pipelines,
+                       selected by ingestion mode, each a single-pass incremental clusterer
+                       with a 600 s rolling active window anchored to incident end_time:
+                         - "csv"  -> `_run_topology_alert_fusion`: cascading microservice
+                                     failures correlated on topology + time. A brand-new
+                                     component arriving inside a tight window gets a neutral
+                                     component score so the cascade is not fragmented.
+                         - "text" -> `_run_text_alert_fusion`: system-log temporal bursts
+                                     with adaptive decay and a flood "absorption" rule that
+                                     lowers the assignment threshold during alert storms.
     * Adaptive decay : lambda = ln(2) / median(inter-arrival delta) in the active window,
                        static fallback only when the window has < 2 events or a 0 delta.
-    * Anti-Flapping  : merge closed incidents when gap <= 1800 s AND dominant-component
-                       AND dominant-template signatures are identical.
+    * Anti-Flapping  : merge adjacent closed incidents when gap <= 1800 s AND their
+                       involved-component sets intersect (share at least one component).
 """
 
 from __future__ import annotations
@@ -95,10 +104,46 @@ FLAPPING_WINDOW_SEC = 1800
 TIME_DECAY_LAMBDA = 0.003
 _LN2 = 0.6931471805599453  # math.log(2), inlined to keep the import surface minimal.
 
-# Similarity signal weights (sum to 1.0).
+# Similarity signal weights (sum to 1.0). These are the unified defaults; the two data
+# families override them below because a single weighting breaks on both density extremes.
 W_TIME = 0.35
 W_COMPONENT = 0.30
 W_TEXT = 0.35
+
+# --- Family-specific AlertFusion weighting (each family's triple sums to 1.0) ----------
+# Topology / CSV pipeline (cascading microservice telemetry): time proximity leads so a
+# tight burst of failures stays in one cascade, with component and text as light tie-breakers.
+# The Jaccard trap (a new failing component scoring 0.0 and dragging the total below the
+# threshold) is neutralized in the component scorer, not by inflating the component weight.
+CSV_W_TIME = 0.60
+CSV_W_COMPONENT = 0.20
+CSV_W_TEXT = 0.20
+# Text pipeline (system logs): time decay leads to anchor temporal bursts, with strict
+# template similarity as the primary discriminator and component as a light tie-breaker.
+TEXT_W_TIME = 0.50
+TEXT_W_COMPONENT = 0.10
+TEXT_W_TEXT = 0.40
+
+# Topology pipeline "Jaccard trap" fix: a brand-new failing component that arrives within
+# this tight window of the cascade's end_time AND during a confirmed burst receives a neutral
+# component score instead of 0.0, so the high time affinity can pull it into the cascade.
+# The tight 5 s window (down from 10 s) combined with the burst-density guard prevents creeping
+# background noise from continuously extending a cascade into a multi-hour mega-incident.
+TOPOLOGY_NEUTRAL_COMPONENT_WINDOW_SEC = 5.0
+TOPOLOGY_NEUTRAL_COMPONENT_SCORE = 0.5
+
+# Hard ceiling on topology-incident lifespan. Once an incident's elapsed wall-clock time
+# exceeds this limit it is excluded from the active pool, forcing the cascade to close and a
+# clean incident to open. This prevents the rolling end_time anchor from enabling a single
+# incident to span the full dataset when background noise keeps arriving.
+TOPOLOGY_MAX_INCIDENT_DURATION_SEC = 3600
+
+# Text pipeline "absorption" rule: when the active-window median inter-arrival delta collapses
+# (an alert flood / storm), the required assignment threshold is temporarily lowered by
+# TEXT_ABSORPTION_THRESHOLD_DROP so rapid consequential errors are absorbed into one incident
+# despite slight textual variation.
+TEXT_ABSORPTION_MEDIAN_DELTA_SEC = 1.0
+TEXT_ABSORPTION_THRESHOLD_DROP = 0.2
 
 MAX_TEMPLATE_CHARS = 256
 
@@ -578,31 +623,120 @@ def component_score(event_component: str, component_counts: Counter[str]) -> flo
     return 1.0 / len(component_counts)
 
 
-def similarity_score(
+def topology_component_score(
+    event_component: str,
+    component_counts: Counter[str],
+    delta_to_end_sec: float,
+    median_delta: float | None,
+) -> float:
+    """
+    Topology-pipeline component signal that defuses the "Jaccard trap".
+
+    A component already seen in the cascade scores by single-element Jaccard. A brand-new
+    component normally scores 0.0, which drags the weighted total below the assignment
+    threshold and fragments a cascade into one event per incident. To prevent that, the
+    neutral score (TOPOLOGY_NEUTRAL_COMPONENT_SCORE) is granted only when BOTH hold:
+
+        1. The component arrives within TOPOLOGY_NEUTRAL_COMPONENT_WINDOW_SEC (5 s) of the
+           incident's end_time — tight enough to confirm topological proximity.
+        2. The active-window median inter-arrival delta is also below the tight window —
+           confirming a genuine structural burst rather than creeping background noise.
+
+    If either condition fails, the component scores 0.0 and the cascade does not absorb it,
+    preventing the infinite cascade loop where background noise continuously extends end_time.
+    """
+    if not component_counts:
+        return 0.0
+    if event_component in component_counts:
+        return 1.0 / len(component_counts)
+    # Neutral score requires confirmed burst: both the event's proximity to the cascade tip
+    # and the window-level density must indicate a tight structural failure propagation.
+    in_tight_window = delta_to_end_sec <= TOPOLOGY_NEUTRAL_COMPONENT_WINDOW_SEC
+    burst_density = median_delta is not None and median_delta < TOPOLOGY_NEUTRAL_COMPONENT_WINDOW_SEC
+    if in_tight_window and burst_density:
+        return TOPOLOGY_NEUTRAL_COMPONENT_SCORE
+    return 0.0
+
+
+def topology_similarity_score(
     event_ts: pd.Timestamp,
     event_component: str,
     event_template: str,
     inc: Incident,
     params: FusionParams,
-    lam: float = TIME_DECAY_LAMBDA,
+    lam: float,
+    median_delta: float | None,
 ) -> float:
+    """Topology pipeline score: time-led, with the Jaccard-trap-safe component signal."""
     s_t = time_proximity_score(event_ts, inc.end_time, lam)
-    s_c = component_score(event_component, inc.component_counts)
+    delta_to_end = (event_ts - inc.end_time).total_seconds()
+    s_c = topology_component_score(event_component, inc.component_counts, delta_to_end, median_delta)
     s_m = template_similarity(event_template, inc.last_template)
+    return params.w_time * s_t + params.w_component * s_c + params.w_text * s_m
+
+
+def text_similarity_score(
+    event_ts: pd.Timestamp,
+    event_component: str,
+    event_template: str,
+    inc: Incident,
+    params: FusionParams,
+    lam: float,
+) -> float:
+    """
+    Text pipeline score: structure-conditional time decay + strict template Jaccard.
+
+    Template similarity is computed first and drives the time decay decision:
+
+        s_m == 1.0 (exact structural match): s_time is set to 1.0, bypassing the
+            exponential decay entirely. Structurally identical log signatures spanning
+            large temporal gaps belong to the same operational sequence (e.g. periodic
+            HDFS block reports) and must not be fragmented by an aggressive time penalty.
+
+        s_m < 1.0 (partial or no match): the adaptive decay (effective_lam) is applied
+            normally. Different sub-systems or phases that happen to sit far apart in time
+            should only merge when the time proximity score is still meaningfully high.
+    """
+    s_m = template_similarity(event_template, inc.last_template)
+    s_t = 1.0 if s_m == 1.0 else time_proximity_score(event_ts, inc.end_time, lam)
+    s_c = component_score(event_component, inc.component_counts)
     return params.w_time * s_t + params.w_component * s_c + params.w_text * s_m
 
 
 def is_active(
     event_ts: pd.Timestamp, inc: Incident, active_window_sec: int = ACTIVE_WINDOW_SEC
 ) -> bool:
-    gap_sec = (event_ts - inc.end_time).total_seconds()
-    return gap_sec <= active_window_sec
+    """
+    Rolling active-window test anchored to the incident end_time.
+
+    Both pipelines slide from end_time so a contiguous stream — a low-density log burst or a
+    long microservice cascade — keeps clustering for as long as related events keep arriving
+    within `active_window_sec`, rather than being artificially truncated by a start_time cap.
+    """
+    return (event_ts - inc.end_time).total_seconds() <= active_window_sec
 
 
 def default_fusion_params() -> FusionParams:
     return FusionParams(
         w_time=W_TIME, w_component=W_COMPONENT, w_text=W_TEXT, assign_threshold=ASSIGN_THRESHOLD
     )
+
+
+def fusion_params_for_mode(mode: str, assign_threshold: float = ASSIGN_THRESHOLD) -> FusionParams:
+    """
+    Select the family-specific similarity weighting for AlertFusion.
+
+    A single unified weighting breaks on both density extremes, so the weights branch on
+    the ingested `mode` string, one weighting per isolated pipeline:
+        "csv"  -> time-dominant (topology cascade: time proximity holds the burst together).
+        "text" -> time + template (temporal bursts discriminated by strict template overlap).
+    Any other value falls back to the unified defaults.
+    """
+    if mode == "csv":
+        return FusionParams(CSV_W_TIME, CSV_W_COMPONENT, CSV_W_TEXT, assign_threshold)
+    if mode == "text":
+        return FusionParams(TEXT_W_TIME, TEXT_W_COMPONENT, TEXT_W_TEXT, assign_threshold)
+    return FusionParams(W_TIME, W_COMPONENT, W_TEXT, assign_threshold)
 
 
 def involved_components_cell(ctr: Counter[str]) -> str:
@@ -619,13 +753,22 @@ def _as_ts(val: object) -> pd.Timestamp:
 # Stage 3 — Anti-Flapping merge pass (mandatory post-processing)
 # ===========================================================================
 def merge_incidents(
-    incidents: list[Incident], flapping_window_sec: int = FLAPPING_WINDOW_SEC
+    incidents: list[Incident],
+    flapping_window_sec: int = FLAPPING_WINDOW_SEC,
+    max_duration_sec: int | None = None,
 ) -> tuple[list[Incident], dict[int, int]]:
     """
     Merge adjacent closed incidents when ALL hold:
         1. gap = next.start_time - current.end_time <= flapping_window_sec
-        2. identical dominant component
-        3. identical dominant message template
+        2. their involved-component sets intersect (share at least one component)
+        3. the resulting merged incident would not exceed max_duration_sec (when set)
+
+    Condition 3 is used by the topology pipeline to ensure the ceiling introduced by
+    TOPOLOGY_MAX_INCIDENT_DURATION_SEC is not silently undone by the merge pass: a
+    force-closed incident must not be re-stitched to the next one if the combined span
+    would exceed the maximum lifespan, preventing a continuous cascade from being
+    re-assembled into a multi-hour mega-incident after clustering.
+
     Returns the merged list (ordered by start_time) and an old->final id map.
     """
     if not incidents:
@@ -642,15 +785,15 @@ def merge_incidents(
         old_to_root[nxt.incident_id] = nxt.incident_id
         gap_sec = (nxt.start_time - current.end_time).total_seconds()
 
-        cur_dom_comp = current.dominant_component()
-        nxt_dom_comp = nxt.dominant_component()
-        same_component = bool(cur_dom_comp) and cur_dom_comp == nxt_dom_comp
+        shared_components = bool(set(current.component_counts) & set(nxt.component_counts))
 
-        cur_dom_tmpl = current.dominant_message()
-        nxt_dom_tmpl = nxt.dominant_message()
-        same_template = bool(cur_dom_tmpl) and cur_dom_tmpl == nxt_dom_tmpl
+        would_exceed_ceiling = (
+            max_duration_sec is not None
+            and (max(current.end_time, nxt.end_time) - current.start_time).total_seconds()
+            > max_duration_sec
+        )
 
-        if gap_sec <= flapping_window_sec and same_component and same_template:
+        if gap_sec <= flapping_window_sec and shared_components and not would_exceed_ceiling:
             current.end_time = max(current.end_time, nxt.end_time)
             current.event_count += nxt.event_count
             current.component_counts.update(nxt.component_counts)
@@ -676,32 +819,27 @@ def merge_incidents(
 # ===========================================================================
 # Stage 3 — AlertFusion single-pass incremental clustering
 # ===========================================================================
-def run_alert_fusion(
-    df: pd.DataFrame,
-    params: FusionParams | None = None,
-    active_window_sec: int = ACTIVE_WINDOW_SEC,
-    flapping_window_sec: int = FLAPPING_WINDOW_SEC,
-) -> tuple[list[Incident], list[int]]:
+def _iter_active_window_decay(
+    df: pd.DataFrame, active_window_sec: int
+) -> Iterable[tuple[int, pd.Timestamp, str, str, str, float, float | None]]:
     """
-    Single-pass incremental correlation with an active sliding window, adaptive lambda
-    time decay, and a mandatory anti-flapping merge pass.
+    Shared event iterator that maintains the rolling active-window inter-arrival statistics.
 
-    Returns (merged_incidents, per_event_final_incident_ids) aligned to df row order.
+    Both pipelines need the same adaptive decay machinery, so the (mathematically identical)
+    windowing lives here while the pipelines keep their own clustering policy. For each event
+    it yields:
+        (row_index, timestamp, component, raw_message, masked_template, adaptive_lam, median_delta)
+
+    `adaptive_lam` is ln(2) / median(inter-arrival delta) over the active window (static
+    fallback when the window has < 1 delta or a 0 median). `median_delta` is the active-window
+    median inter-arrival gap in seconds, or None before any delta exists.
+
+    `window_deltas` mirrors the consecutive gaps in arrival order so the leading gap can be
+    dropped when the oldest timestamp expires; `sorted_deltas` is the same multiset kept
+    ordered (via bisect) so the median is an O(1) midpoint lookup each event, avoiding the
+    O(W log W) re-sort that would otherwise run on every incoming event.
     """
-    if params is None:
-        params = default_fusion_params()
-
-    incidents: list[Incident] = []
-    active_pool: list[Incident] = []
-    event_incident_ids: list[int] = []
-    next_id = 1
-
     window_ts: deque[pd.Timestamp] = deque()
-    # Incrementally maintained inter-arrival deltas for the active window.
-    # `window_deltas` mirrors the consecutive gaps in arrival order so we can drop the
-    # leading gap when the oldest timestamp expires; `sorted_deltas` is the same multiset
-    # kept ordered (via bisect) so the median is an O(1) midpoint lookup each event,
-    # avoiding the O(W log W) re-sort that ran on every incoming log line.
     window_deltas: deque[float] = deque()
     sorted_deltas: list[float] = []
 
@@ -729,6 +867,7 @@ def run_alert_fusion(
         window_ts.append(ts)
 
         adaptive_lam = TIME_DECAY_LAMBDA
+        median_delta: float | None = None
         n_d = len(sorted_deltas)
         if n_d >= 1:
             median_delta = (
@@ -739,12 +878,69 @@ def run_alert_fusion(
             if median_delta > 0.0:
                 adaptive_lam = _LN2 / median_delta
 
-        active_pool = [inc for inc in active_pool if is_active(ts, inc, active_window_sec)]
-        active = active_pool
+        yield i, ts, comp, msg, msg_template, adaptive_lam, median_delta
+
+
+def _new_incident(
+    incident_id: int, ts: pd.Timestamp, comp: str, msg: str, msg_template: str
+) -> Incident:
+    return Incident(
+        incident_id=incident_id,
+        start_time=ts,
+        end_time=ts,
+        component_counts=Counter({comp: 1}),
+        message_counts=Counter({msg_template: 1}),
+        event_count=1,
+        last_message=msg,
+        last_template=msg_template,
+    )
+
+
+def _run_topology_alert_fusion(
+    df: pd.DataFrame,
+    params: FusionParams | None = None,
+    active_window_sec: int = ACTIVE_WINDOW_SEC,
+    flapping_window_sec: int = FLAPPING_WINDOW_SEC,
+) -> tuple[list[Incident], list[int]]:
+    """
+    Pipeline A — AIOpsArena CSV: cluster cascading microservice failures on topology + time.
+
+    Policy isolated to this pipeline:
+        * Active window is a rolling window anchored to incident end_time.
+        * Hard lifespan ceiling: incidents older than TOPOLOGY_MAX_INCIDENT_DURATION_SEC (1 h)
+          are force-closed regardless of whether new events keep arriving, breaking the
+          "infinite cascade loop" where rolling end_time absorption created multi-hour giants.
+        * Adaptive time decay (lambda = ln(2) / median delta) is retained.
+        * The component signal uses topology_component_score: a brand-new failing component
+          inside a tight window AND during a confirmed burst gets a neutral score (instead of
+          0.0) so the high time score can still pull it into the cascade, but creeping
+          background noise can no longer exploit this to extend the incident indefinitely.
+        * Weights: Time = 0.60, Component = 0.20, Text = 0.20.
+
+    Returns (merged_incidents, per_event_final_incident_ids) aligned to df row order.
+    """
+    if params is None:
+        params = fusion_params_for_mode("csv")
+
+    incidents: list[Incident] = []
+    active_pool: list[Incident] = []
+    event_incident_ids: list[int] = []
+    next_id = 1
+
+    for _i, ts, comp, msg, msg_template, adaptive_lam, median in _iter_active_window_decay(
+        df, active_window_sec
+    ):
+        # Rolling end_time window; incidents that hit the maximum lifespan ceiling are
+        # evicted regardless of recent activity so a cascade cannot run indefinitely.
+        active_pool = [
+            inc for inc in active_pool
+            if (ts - inc.end_time).total_seconds() <= active_window_sec
+            and (ts - inc.start_time).total_seconds() <= TOPOLOGY_MAX_INCIDENT_DURATION_SEC
+        ]
         best: Incident | None = None
         best_score = -1.0
-        for inc in active:
-            sc = similarity_score(ts, comp, msg_template, inc, params, lam=adaptive_lam)
+        for inc in active_pool:
+            sc = topology_similarity_score(ts, comp, msg_template, inc, params, adaptive_lam, median)
             if sc > best_score:
                 best_score = sc
                 best = inc
@@ -755,16 +951,78 @@ def run_alert_fusion(
             best.add_event(ts, comp, msg)
             event_incident_ids.append(best.incident_id)
         else:
-            inc = Incident(
-                incident_id=next_id,
-                start_time=ts,
-                end_time=ts,
-                component_counts=Counter({comp: 1}),
-                message_counts=Counter({msg_template: 1}),
-                event_count=1,
-                last_message=msg,
-                last_template=msg_template,
-            )
+            inc = _new_incident(next_id, ts, comp, msg, msg_template)
+            incidents.append(inc)
+            active_pool.append(inc)
+            event_incident_ids.append(inc.incident_id)
+            next_id += 1
+
+    # Pass the duration ceiling to the merge pass so force-closed incidents are not
+    # re-stitched into a mega-incident when they share components and a small gap.
+    merged_incidents, id_map = merge_incidents(
+        incidents, flapping_window_sec, max_duration_sec=TOPOLOGY_MAX_INCIDENT_DURATION_SEC
+    )
+    final_event_ids = [id_map.get(i, i) for i in event_incident_ids]
+    return merged_incidents, final_event_ids
+
+
+def _run_text_alert_fusion(
+    df: pd.DataFrame,
+    params: FusionParams | None = None,
+    active_window_sec: int = ACTIVE_WINDOW_SEC,
+    flapping_window_sec: int = FLAPPING_WINDOW_SEC,
+) -> tuple[list[Incident], list[int]]:
+    """
+    Pipeline B — LogHub text: cluster system logs on temporal bursts + strict templates.
+
+    Policy isolated to this pipeline:
+        * Active window is a rolling window anchored to incident end_time.
+        * Time decay is *restored* (adaptive lambda = ln(2) / median delta), so a wide
+          temporal gap properly discounts the time signal instead of being neutralized.
+        * Absorption rule: when the active-window median inter-arrival delta collapses
+          (an alert flood), the required assignment threshold is temporarily lowered by
+          TEXT_ABSORPTION_THRESHOLD_DROP so rapid consequential errors are absorbed into the
+          same incident despite slight text variations.
+        * Weights: Time = 0.50, Text = 0.40, Component = 0.10.
+
+    Returns (merged_incidents, per_event_final_incident_ids) aligned to df row order.
+    """
+    if params is None:
+        params = fusion_params_for_mode("text")
+
+    incidents: list[Incident] = []
+    active_pool: list[Incident] = []
+    event_incident_ids: list[int] = []
+    next_id = 1
+
+    for _i, ts, comp, msg, msg_template, adaptive_lam, median_delta in _iter_active_window_decay(
+        df, active_window_sec
+    ):
+        active_pool = [
+            inc for inc in active_pool if (ts - inc.end_time).total_seconds() <= active_window_sec
+        ]
+
+        # Absorption rule: during an alert flood the threshold drops so a burst of rapid
+        # consequential errors collapses into one incident despite textual variation.
+        effective_threshold = params.assign_threshold
+        if median_delta is not None and median_delta < TEXT_ABSORPTION_MEDIAN_DELTA_SEC:
+            effective_threshold = params.assign_threshold - TEXT_ABSORPTION_THRESHOLD_DROP
+
+        best: Incident | None = None
+        best_score = -1.0
+        for inc in active_pool:
+            sc = text_similarity_score(ts, comp, msg_template, inc, params, adaptive_lam)
+            if sc > best_score:
+                best_score = sc
+                best = inc
+            elif sc == best_score and best is not None and inc.incident_id < best.incident_id:
+                best = inc
+
+        if best is not None and best_score >= effective_threshold:
+            best.add_event(ts, comp, msg)
+            event_incident_ids.append(best.incident_id)
+        else:
+            inc = _new_incident(next_id, ts, comp, msg, msg_template)
             incidents.append(inc)
             active_pool.append(inc)
             event_incident_ids.append(inc.incident_id)
@@ -773,6 +1031,27 @@ def run_alert_fusion(
     merged_incidents, id_map = merge_incidents(incidents, flapping_window_sec)
     final_event_ids = [id_map.get(i, i) for i in event_incident_ids]
     return merged_incidents, final_event_ids
+
+
+def run_alert_fusion(
+    df: pd.DataFrame,
+    params: FusionParams | None = None,
+    active_window_sec: int = ACTIVE_WINDOW_SEC,
+    flapping_window_sec: int = FLAPPING_WINDOW_SEC,
+    mode: str = "text",
+) -> tuple[list[Incident], list[int]]:
+    """
+    AlertFusion dispatcher: route to one of the two isolated clustering pipelines by `mode`.
+
+        mode == "csv"  -> `_run_topology_alert_fusion`  (microservice cascade correlation)
+        mode == "text" -> `_run_text_alert_fusion`      (system-log temporal bursts)
+
+    Both return (merged_incidents, per_event_final_incident_ids) aligned to df row order,
+    consumed downstream by `incidents_to_dataframe` and `build_metrics`.
+    """
+    if mode == "csv":
+        return _run_topology_alert_fusion(df, params, active_window_sec, flapping_window_sec)
+    return _run_text_alert_fusion(df, params, active_window_sec, flapping_window_sec)
 
 
 def incidents_to_dataframe(incidents: list[Incident]) -> pd.DataFrame:
@@ -1049,8 +1328,13 @@ def analyze(
     skipped_count = 0
     if isinstance(source, pd.DataFrame):
         normalized_df = source[["timestamp", "component", "raw_message"]].copy()
+        # No path to sniff for an in-memory frame: honour an explicit mode, else text.
+        resolved_mode = mode if mode in ("csv", "text") else "text"
     else:
-        result = ingest_events(Path(source), mode=mode)
+        src_path = Path(source)
+        # Resolve the family once so ingestion, weighting, and the window anchor all agree.
+        resolved_mode = mode if mode in ("csv", "text") else detect_family(src_path)
+        result = ingest_events(src_path, mode=resolved_mode)
         normalized_df = result.normalized_df
         skipped_count = result.skipped_count
 
@@ -1059,11 +1343,13 @@ def analyze(
     baseline_incidents = group_baseline_incidents(events, baseline_window_sec)
     baseline_event_ids = event_to_baseline_incident_ids(events, baseline_window_sec)
 
-    params = FusionParams(
-        w_time=W_TIME, w_component=W_COMPONENT, w_text=W_TEXT, assign_threshold=assign_threshold
-    )
+    params = fusion_params_for_mode(resolved_mode, assign_threshold)
     incidents, alert_event_ids = run_alert_fusion(
-        events, params, active_window_sec=active_window_sec, flapping_window_sec=flapping_window_sec
+        events,
+        params,
+        active_window_sec=active_window_sec,
+        flapping_window_sec=flapping_window_sec,
+        mode=resolved_mode,
     )
     alert_incidents = incidents_to_dataframe(incidents)
 
@@ -1088,12 +1374,20 @@ def analyze(
         gt_source=str(ground_truth_path) if ground_truth_path is not None else None,
         gt_skipped=gt_skipped,
     )
-    # Record the parameters this run actually used so the UI reflects them dynamically.
+    # Record the parameters this run actually used so the UI reflects them dynamically,
+    # including the resolved family and its branched similarity weights / decay policy.
     metrics["parameters"] = {
+        "mode": resolved_mode,
+        "pipeline": "topology" if resolved_mode == "csv" else "text",
         "assign_threshold": assign_threshold,
         "active_window_sec": active_window_sec,
+        "active_window_anchor": "end_time",  # both pipelines now use a rolling end_time window
         "baseline_window_sec": baseline_window_sec,
         "flapping_window_sec": flapping_window_sec,
+        "w_time": params.w_time,
+        "w_component": params.w_component,
+        "w_text": params.w_text,
+        "time_decay": "adaptive",
     }
 
     return AnalysisResult(
@@ -1354,6 +1648,16 @@ def render_dashboard() -> None:
         gt_arg = gt_path if gt_path and Path(gt_path).is_file() else None
         return analyze(log_path, mode=mode, ground_truth_path=gt_arg)
 
+    def _format_components(comp_str: str, max_display: int = 3) -> str:
+        """Return a human-readable summary of a semicolon-separated component list."""
+        if not comp_str:
+            return "—"
+        parts = [p.strip() for p in str(comp_str).split(";") if p.strip()]
+        if len(parts) <= max_display:
+            return ", ".join(parts)
+        preview = ", ".join(parts[:max_display])
+        return f"{len(parts)} components: {preview}… (Truncated)"
+
     st.title("Syncident — Enterprise Incident Noise Reduction Platform")
 
     # --- Sidebar: automatic local stream selector -------------------------
@@ -1419,18 +1723,35 @@ def render_dashboard() -> None:
     c3.metric("AlertFusion incidents", f"{a['n_incidents']:,}")
     c4.metric(
         "Noise Reduction Ratio",
-        f"{a['nrr']:.4f}",
-        delta=f"{a['nrr'] - b['nrr']:+.4f} vs baseline",
+        f"{a['nrr']:.5f}",
+        delta=f"{a['nrr'] - b['nrr']:+.5f} vs baseline",
     )
 
     st.subheader("Fault alignment (AlertFusion vs ground truth)")
     if has_gt:
-        align = metrics["alignment_metrics"]["alert_fusion"]
+        af_align = metrics["alignment_metrics"]["alert_fusion"]
+        base_align = metrics["alignment_metrics"]["baseline"]
         p1, p2, p3, p4 = st.columns(4)
-        p1.metric("Precision (temporal)", f"{align['precision_temporal']:.3f}")
-        p2.metric("Recall (temporal)", f"{align['recall_temporal']:.3f}")
-        p3.metric("Precision (component)", f"{align['precision_component_aware']:.3f}")
-        p4.metric("Recall (component)", f"{align['recall_component_aware']:.3f}")
+        p1.metric(
+            "Precision (temporal)",
+            f"{af_align['precision_temporal']:.3f}",
+            delta=f"{af_align['precision_temporal'] - base_align['precision_temporal']:+.3f} vs baseline",
+        )
+        p2.metric(
+            "Recall (temporal)",
+            f"{af_align['recall_temporal']:.3f}",
+            delta=f"{af_align['recall_temporal'] - base_align['recall_temporal']:+.3f} vs baseline",
+        )
+        p3.metric(
+            "Precision (component)",
+            f"{af_align['precision_component_aware']:.3f}",
+            delta=f"{af_align['precision_component_aware'] - base_align['precision_component_aware']:+.3f} vs baseline",
+        )
+        p4.metric(
+            "Recall (component)",
+            f"{af_align['recall_component_aware']:.3f}",
+            delta=f"{af_align['recall_component_aware'] - base_align['recall_component_aware']:+.3f} vs baseline",
+        )
     else:
         st.info(
             f"No matching ground-truth JSON found for `{selected_file}` — "
@@ -1439,24 +1760,46 @@ def render_dashboard() -> None:
 
     # --- 2. Comparative summary table -------------------------------------
     st.subheader("Baseline vs AlertFusion")
+    metrics_labels = ["Incidents", "NRR", "Avg duration (s)", "Avg components / incident"]
+    baseline_vals = [
+        b["n_incidents"],
+        round(b["nrr"], 5),
+        b["avg_duration_seconds"],
+        b["avg_components_per_incident"],
+    ]
+    af_vals = [
+        a["n_incidents"],
+        round(a["nrr"], 5),
+        a["avg_duration_seconds"],
+        a["avg_components_per_incident"],
+    ]
+    if has_gt:
+        metrics_labels += [
+            "Precision (temporal)",
+            "Recall (temporal)",
+            "Precision (component)",
+            "Recall (component)",
+        ]
+        baseline_vals += [
+            base_align["precision_temporal"],
+            base_align["recall_temporal"],
+            base_align["precision_component_aware"],
+            base_align["recall_component_aware"],
+        ]
+        af_vals += [
+            af_align["precision_temporal"],
+            af_align["recall_temporal"],
+            af_align["precision_component_aware"],
+            af_align["recall_component_aware"],
+        ]
     comparison = pd.DataFrame(
         {
-            "Metric": ["Incidents", "NRR", "Avg duration (s)", "Avg components / incident"],
-            "Baseline": [
-                b["n_incidents"],
-                b["nrr"],
-                b["avg_duration_seconds"],
-                b["avg_components_per_incident"],
-            ],
-            "AlertFusion": [
-                a["n_incidents"],
-                a["nrr"],
-                a["avg_duration_seconds"],
-                a["avg_components_per_incident"],
-            ],
+            "Metric": metrics_labels,
+            "Baseline": baseline_vals,
+            "AlertFusion": af_vals,
         }
     )
-    st.dataframe(comparison, width="stretch", hide_index=True)
+    st.dataframe(comparison, use_container_width=True, hide_index=True)
     if result.skipped_count:
         st.caption(f"Skipped {result.skipped_count:,} malformed input rows during ingestion.")
 
@@ -1495,7 +1838,7 @@ def render_dashboard() -> None:
                     line_width=0,
                 )
             st.caption("Red bands mark ground-truth fault windows (hits fall inside, misses outside).")
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
 
@@ -1509,61 +1852,64 @@ def render_dashboard() -> None:
         srow = incidents_summary[incidents_summary["incident_id"] == selected_incident].iloc[0]
         st.caption(
             f"Window: {srow['start_time']} → {srow['end_time']}  |  "
-            f"{int(srow['event_count'])} events  |  components: {srow['involved_components']}"
+            f"{int(srow['event_count'])} events  |  components: {_format_components(srow['involved_components'])}"
         )
         slice_df = result.events_df[result.events_df["alert_incident_id"] == int(selected_incident)]
-        st.dataframe(slice_df, width="stretch", hide_index=True)
+        st.dataframe(slice_df, use_container_width=True, hide_index=True)
 
     st.divider()
 
     # --- 5. Algorithmic case studies (in-memory alignment flags) ----------
     st.header("Algorithmic case studies")
-    flagged = _incident_alignment_flags(result.alert_incidents, result.ground_truth_df)
-    success_id = _pick_success_incident(flagged)
-    error_id = _pick_error_incident(flagged, exclude_id=success_id)
+    if not has_gt:
+        st.info("Algorithmic case studies require a valid ground-truth JSON file to evaluate hits and false positives.")
+    else:
+        flagged = _incident_alignment_flags(result.alert_incidents, result.ground_truth_df)
+        success_id = _pick_success_incident(flagged)
+        error_id = _pick_error_incident(flagged, exclude_id=success_id)
 
-    cs1, cs2 = st.columns(2)
+        cs1, cs2 = st.columns(2)
 
-    with cs1:
-        st.subheader("Case Study 1 — Perfect alignment")
-        if success_id is None:
-            st.info("No verified hit available for this dataset/ground truth.")
-        else:
-            row = flagged[flagged["incident_id"] == success_id].iloc[0]
-            st.markdown(
-                f"**Incident `{success_id}`** grouped a burst of "
-                f"**{int(row['event_count'])}** cascading events that falls inside a fault "
-                f"window (temporal{' + component-aware' if row['aligned_component'] else ''} match)."
-            )
-            st.caption(f"Window: {row['start_time']} → {row['end_time']}  |  components: {row['involved_components']}")
-            st.dataframe(
-                result.events_df[result.events_df["alert_incident_id"] == int(success_id)],
-                width="stretch",
-                hide_index=True,
-            )
-
-    with cs2:
-        st.subheader("Case Study 2 — Model limitation")
-        if error_id is None:
-            st.info("No representative error case available for this dataset/ground truth.")
-        else:
-            row = flagged[flagged["incident_id"] == error_id].iloc[0]
-            if int(row["event_count"]) == 1:
-                reason = (
-                    "isolated singleton — text similarity dropped below the "
-                    f"{ASSIGN_THRESHOLD} threshold, so this event was split into its own cluster"
-                )
-            elif not bool(row["aligned_temporal"]):
-                reason = "false positive — incident does not overlap any ground-truth fault window"
+        with cs1:
+            st.subheader("Case Study 1 — Perfect alignment")
+            if success_id is None:
+                st.info("No verified hit available for this dataset/ground truth.")
             else:
-                reason = "boundary case for manual trace inspection"
-            st.markdown(f"**Incident `{error_id}`** illustrates a {reason}.")
-            st.caption(f"Window: {row['start_time']} → {row['end_time']}  |  components: {row['involved_components']}")
-            st.dataframe(
-                result.events_df[result.events_df["alert_incident_id"] == int(error_id)],
-                width="stretch",
-                hide_index=True,
-            )
+                row = flagged[flagged["incident_id"] == success_id].iloc[0]
+                st.markdown(
+                    f"**Incident `{success_id}`** grouped a burst of "
+                    f"**{int(row['event_count'])}** cascading events that falls inside a fault "
+                    f"window (temporal{' + component-aware' if row['aligned_component'] else ''} match)."
+                )
+                st.caption(f"Window: {row['start_time']} → {row['end_time']}  |  components: {_format_components(row['involved_components'])}")
+                st.dataframe(
+                    result.events_df[result.events_df["alert_incident_id"] == int(success_id)],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        with cs2:
+            st.subheader("Case Study 2 — Model limitation")
+            if error_id is None:
+                st.info("No representative error case available for this dataset/ground truth.")
+            else:
+                row = flagged[flagged["incident_id"] == error_id].iloc[0]
+                if int(row["event_count"]) == 1:
+                    reason = (
+                        "an isolated singleton — text similarity dropped below the "
+                        f"{ASSIGN_THRESHOLD} threshold, so this event was split into its own cluster"
+                    )
+                elif not bool(row["aligned_temporal"]):
+                    reason = "a false positive — incident does not overlap any ground-truth fault window"
+                else:
+                    reason = "a boundary case for manual trace inspection"
+                st.markdown(f"**Incident `{error_id}`** illustrates {reason}.")
+                st.caption(f"Window: {row['start_time']} → {row['end_time']}  |  components: {_format_components(row['involved_components'])}")
+                st.dataframe(
+                    result.events_df[result.events_df["alert_incident_id"] == int(error_id)],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
 
 # ===========================================================================
